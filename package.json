@@ -1,8 +1,8 @@
 {
-  "name": "my-medusa-backend",
-  "version": "0.0.1",
-  "description": "A starter for Medusa projects.",
-  "author": "Medusa (https://medusajs.com)",
+  "name": "movefuture-backend",
+  "version": "1.0.0",
+  "description": "Backend for MoveFuture e-commerce platform",
+  "author": "MoveFuture Team",
   "license": "MIT",
   "keywords": [
     "sqlite",
