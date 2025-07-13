@@ -27,6 +27,7 @@ export default async function seedDemoData({ container }: ExecArgs) {
   const fulfillmentModuleService = container.resolve(Modules.FULFILLMENT);
   const salesChannelModuleService = container.resolve(Modules.SALES_CHANNEL);
   const storeModuleService = container.resolve(Modules.STORE);
+  // Используем только доступные сервисы
 
   const countries = ["gb", "de", "dk", "se", "fr", "es", "it"];
 
@@ -70,29 +71,46 @@ export default async function seedDemoData({ container }: ExecArgs) {
     },
   });
   logger.info("Seeding region data...");
-  const { result: regionResult } = await createRegionsWorkflow(container).run({
-    input: {
-      regions: [
-        {
-          name: "Europe",
-          currency_code: "eur",
-          countries,
-          payment_providers: ["pp_system_default"],
-        },
-      ],
-    },
-  });
-  const region = regionResult[0];
-  logger.info("Finished seeding regions.");
+  let region;
+  try {
+    const { result: regionResult } = await createRegionsWorkflow(container).run({
+      input: {
+        regions: [
+          {
+            name: "Europe",
+            currency_code: "eur",
+            countries,
+            payment_providers: ["pp_system_default"],
+          },
+        ],
+      },
+    });
+    region = regionResult[0];
+    logger.info("Finished seeding regions (created).");
+  } catch (err: any) {
+    logger.warn(`Region already exists or failed to create: ${err.message}. Using existing region.`);
+    try {
+      const regionModuleService = container.resolve(Modules.REGION);
+      const existing = await regionModuleService.listRegions({ name: "Europe" });
+      if (!existing.length) throw err;
+      region = existing[0];
+    } catch {
+      throw err; // rethrow if we cannot recover
+    }
+  }
 
   logger.info("Seeding tax regions...");
-  await createTaxRegionsWorkflow(container).run({
-    input: countries.map((country_code) => ({
-      country_code,
-      provider_id: "tp_system"
-    })),
-  });
-  logger.info("Finished seeding tax regions.");
+  try {
+    await createTaxRegionsWorkflow(container).run({
+      input: countries.map((country_code) => ({
+        country_code,
+        provider_id: "tp_system",
+      })),
+    });
+    logger.info("Finished seeding tax regions (created).");
+  } catch (err: any) {
+    logger.warn(`Tax regions already exist or failed to create: ${err.message}. Ignoring.`);
+  }
 
   logger.info("Seeding stock location data...");
   const { result: stockLocationResult } = await createStockLocationsWorkflow(
@@ -143,7 +161,10 @@ export default async function seedDemoData({ container }: ExecArgs) {
     shippingProfile = shippingProfileResult[0];
   }
 
-  const fulfillmentSet = await fulfillmentModuleService.createFulfillmentSets({
+  let fulfillmentSet: any;
+  try {
+    // Attempt to create the fulfillment set. This will fail on subsequent seed runs.
+    const createdSets = await fulfillmentModuleService.createFulfillmentSets({
     name: "European Warehouse delivery",
     type: "shipping",
     service_zones: [
@@ -182,15 +203,51 @@ export default async function seedDemoData({ container }: ExecArgs) {
       },
     ],
   });
+    // Store reference to created fulfillment set for later reuse
+    fulfillmentSet = Array.isArray(createdSets) ? createdSets[0] : createdSets;
+  } catch (err: any) {
+    logger.warn(`Fulfillment set already exists or failed to create: ${err.message}. Reusing existing.`);
+    const existingSets = await fulfillmentModuleService.listFulfillmentSets({ name: "European Warehouse delivery" });
+    if (!existingSets.length) {
+      throw err;
+    }
+    fulfillmentSet = existingSets[0];
+  }
 
-  await link.create({
-    [Modules.STOCK_LOCATION]: {
-      stock_location_id: stockLocation.id,
-    },
-    [Modules.FULFILLMENT]: {
-      fulfillment_set_id: fulfillmentSet.id,
-    },
-  });
+  // Fallback in case the fulfillment set was created successfully but not assigned
+  if (!fulfillmentSet) {
+    const allSets = await fulfillmentModuleService.listFulfillmentSets({ name: "European Warehouse delivery" });
+    fulfillmentSet = allSets[0];
+  }
+
+  try {
+    await link.create({
+      [Modules.STOCK_LOCATION]: {
+        stock_location_id: stockLocation.id,
+      },
+      [Modules.FULFILLMENT]: {
+        fulfillment_set_id: fulfillmentSet.id,
+      },
+    });
+  } catch (err: any) {
+    // If the link already exists, ignore the error
+    logger.warn(`Link between stock location and fulfillment set already exists or failed to create: ${err.message}. Skipping.`);
+  }
+
+  // Determine the service zone ID to use for shipping options
+  let serviceZoneId: string | undefined = fulfillmentSet?.service_zones?.[0]?.id;
+  if (!serviceZoneId) {
+    try {
+      const zones = await fulfillmentModuleService.listServiceZones({ name: "Europe" });
+      serviceZoneId = zones?.[0]?.id;
+    } catch (e) {
+      logger.warn(`Unable to fetch service zones: ${(e as Error).message}`);
+    }
+  }
+
+  if (!serviceZoneId) {
+    throw new Error("Unable to resolve service zone id for shipping options");
+  }
 
   await createShippingOptionsWorkflow(container).run({
     input: [
@@ -198,7 +255,7 @@ export default async function seedDemoData({ container }: ExecArgs) {
         name: "Standard Shipping",
         price_type: "flat",
         provider_id: "manual_manual",
-        service_zone_id: fulfillmentSet.service_zones[0].id,
+        service_zone_id: serviceZoneId,
         shipping_profile_id: shippingProfile.id,
         type: {
           label: "Standard",
@@ -231,45 +288,45 @@ export default async function seedDemoData({ container }: ExecArgs) {
             operator: "eq",
           },
         ],
-      },
-      {
-        name: "Express Shipping",
-        price_type: "flat",
-        provider_id: "manual_manual",
-        service_zone_id: fulfillmentSet.service_zones[0].id,
-        shipping_profile_id: shippingProfile.id,
-        type: {
-          label: "Express",
-          description: "Ship in 24 hours.",
-          code: "express",
         },
-        prices: [
-          {
-            currency_code: "usd",
-            amount: 10,
+        {
+          name: "Express Shipping",
+          price_type: "flat",
+          provider_id: "manual_manual",
+          service_zone_id: serviceZoneId,
+          shipping_profile_id: shippingProfile.id,
+          type: {
+            label: "Express",
+            description: "Ship in 24 hours.",
+            code: "express",
           },
-          {
-            currency_code: "eur",
-            amount: 10,
-          },
-          {
-            region_id: region.id,
-            amount: 10,
-          },
-        ],
-        rules: [
-          {
-            attribute: "enabled_in_store",
-            value: "true",
-            operator: "eq",
-          },
-          {
-            attribute: "is_return",
-            value: "false",
-            operator: "eq",
-          },
-        ],
-      },
+          prices: [
+            {
+              currency_code: "usd",
+              amount: 10,
+            },
+            {
+              currency_code: "eur",
+              amount: 10,
+            },
+            {
+              region_id: region.id,
+              amount: 10,
+            },
+          ],
+          rules: [
+            {
+              attribute: "enabled_in_store",
+              value: "true",
+              operator: "eq",
+            },
+            {
+              attribute: "is_return",
+              value: "false",
+              operator: "eq",
+            },
+          ],
+        },
     ],
   });
   logger.info("Finished seeding fulfillment data.");
@@ -283,20 +340,42 @@ export default async function seedDemoData({ container }: ExecArgs) {
   logger.info("Finished seeding stock location data.");
 
   logger.info("Seeding publishable API key data...");
-  const { result: publishableApiKeyResult } = await createApiKeysWorkflow(
-    container
-  ).run({
-    input: {
-      api_keys: [
-        {
-          title: "Webshop",
-          type: "publishable",
-          created_by: "",
-        },
-      ],
-    },
-  });
-  const publishableApiKey = publishableApiKeyResult[0];
+
+  // Re-use existing publishable key called "Webshop" if it already exists
+  let publishableApiKey: { id: string } | undefined;
+
+  try {
+    const { data: existingKeys } = await query.graph({
+      entity: "api_key",
+      fields: ["id", "title", "type"],
+    });
+    publishableApiKey = (existingKeys as any[]).find(
+      (k) => k.title === "Webshop" && k.type === "publishable"
+    );
+  } catch (e: any) {
+    logger.warn(`Failed to query existing API keys: ${e.message}`);
+  }
+
+  if (!publishableApiKey) {
+    const { result: publishableApiKeyResult } = await createApiKeysWorkflow(
+      container
+    ).run({
+      input: {
+        api_keys: [
+          {
+            title: "Webshop",
+            type: "publishable",
+            created_by: "",
+          },
+        ],
+      },
+    });
+    publishableApiKey = publishableApiKeyResult[0];
+    logger.info("Created new publishable API key ‘Webshop’." );
+  } else {
+    logger.info("Reusing existing publishable API key ‘Webshop’." );
+  }
+
 
   await linkSalesChannelsToApiKeyWorkflow(container).run({
     input: {
@@ -308,38 +387,66 @@ export default async function seedDemoData({ container }: ExecArgs) {
 
   logger.info("Seeding product data...");
 
-  const { result: categoryResult } = await createProductCategoriesWorkflow(
-    container
-  ).run({
-    input: {
-      product_categories: [
-        {
-          name: "Shirts",
-          is_active: true,
-        },
-        {
-          name: "Sweatshirts",
-          is_active: true,
-        },
-        {
-          name: "Pants",
-          is_active: true,
-        },
-        {
-          name: "Merch",
-          is_active: true,
-        },
-      ],
-    },
-  });
+  const categoriesToSeed = [
+    "Shirts",
+    "Sweatshirts",
+    "Pants",
+    "Merch",
+    "Scooters",
+  ];
 
-  await createProductsWorkflow(container).run({
+  let categoryResult: any[] = [];
+  let categoryIdByName: Record<string, string> = {};
+
+  const ensureAllCategoriesResolved = () => {
+    const missing = categoriesToSeed.filter((n) => !categoryIdByName[n]);
+    if (missing.length) {
+      throw new Error(`Unable to resolve ids for categories: ${missing.join(", ")}`);
+    }
+  };
+  try {
+    const { result } = await createProductCategoriesWorkflow(container).run({
+      input: {
+        product_categories: categoriesToSeed.map((name) => ({
+          name,
+          is_active: true,
+        })),
+      },
+    });
+    categoryResult = result;
+    categoryResult.forEach((c: any) => (categoryIdByName[c.name] = c.id));
+  } catch (err: any) {
+    logger.warn(
+      `Product categories already exist or failed to create: ${err.message}. Reusing existing categories.`
+    );
+    // Fallback: fetch existing categories by name
+    try {
+      // Fetch existing categories via query API
+      const { data: existingAll } = await query.graph({
+        entity: "product_category",
+        fields: ["id", "name"],
+      });
+      categoryResult = existingAll.filter((c: any) => categoriesToSeed.includes(c.name));
+      categoryResult.forEach((c: any) => (categoryIdByName[c.name] = c.id));
+    } catch (fetchErr: any) {
+      logger.error(
+        `Failed to fetch existing product categories after duplicate error: ${fetchErr.message}`
+      );
+      throw err; // rethrow original
+    }
+  }
+
+  // Verify that all category ids were resolved before creating products
+  ensureAllCategoriesResolved();
+
+  try {
+    await createProductsWorkflow(container).run({
     input: {
       products: [
         {
           title: "Medusa T-Shirt",
           category_ids: [
-            categoryResult.find((cat) => cat.name === "Shirts")!.id,
+            categoryIdByName["Shirts"],
           ],
           description:
             "Reimagine the feeling of a classic T-shirt. With our cotton T-shirts, everyday essentials no longer have to be ordinary.",
@@ -526,7 +633,7 @@ export default async function seedDemoData({ container }: ExecArgs) {
         {
           title: "Medusa Sweatshirt",
           category_ids: [
-            categoryResult.find((cat) => cat.name === "Sweatshirts")!.id,
+            categoryIdByName["Sweatshirts"],
           ],
           description:
             "Reimagine the feeling of a classic sweatshirt. With our cotton sweatshirt, everyday essentials no longer have to be ordinary.",
@@ -627,7 +734,7 @@ export default async function seedDemoData({ container }: ExecArgs) {
         {
           title: "Medusa Sweatpants",
           category_ids: [
-            categoryResult.find((cat) => cat.name === "Pants")!.id,
+            categoryIdByName["Pants"],
           ],
           description:
             "Reimagine the feeling of classic sweatpants. With our cotton sweatpants, everyday essentials no longer have to be ordinary.",
@@ -728,7 +835,7 @@ export default async function seedDemoData({ container }: ExecArgs) {
         {
           title: "Medusa Shorts",
           category_ids: [
-            categoryResult.find((cat) => cat.name === "Merch")!.id,
+            categoryIdByName["Merch"],
           ],
           description:
             "Reimagine the feeling of classic shorts. With our cotton shorts, everyday essentials no longer have to be ordinary.",
@@ -830,6 +937,87 @@ export default async function seedDemoData({ container }: ExecArgs) {
     },
   });
   logger.info("Finished seeding product data.");
+  } catch (err: any) {
+    logger.warn(`Apparel products already exist or failed to create: ${err.message}. Skipping product creation.`);
+  }
+
+  // Добавляем электросамокат вручную, так как его нет в стандартном наборе
+  try {
+    await createProductsWorkflow(container).run({
+    input: {
+      products: [
+        {
+          title: "Electric Scooter X",
+          category_ids: [categoryIdByName["Scooters"]],
+          description:
+            "A lightweight folding electric scooter for urban commuting.",
+          handle: "electric-scooter-x",
+          weight: 14000,
+          status: ProductStatus.PUBLISHED,
+          shipping_profile_id: shippingProfile.id,
+          images: [
+            {
+              url: "https://medusa-public-images.s3.eu-west-1.amazonaws.com/coffee-mug.png",
+            },
+            {
+              url: "https://medusa-public-images.s3.eu-west-1.amazonaws.com/coaster.png",
+            },
+          ],
+          options: [
+            {
+              title: "Color",
+              values: ["Black", "White"],
+            },
+          ],
+          variants: [
+            {
+              title: "Black",
+              sku: "ESCOOT-BLK",
+              options: {
+                Color: "Black",
+              },
+              prices: [
+                {
+                  amount: 499,
+                  currency_code: "eur",
+                },
+                {
+                  amount: 549,
+                  currency_code: "usd",
+                },
+              ],
+            },
+            {
+              title: "White",
+              sku: "ESCOOT-WHT",
+              options: {
+                Color: "White",
+              },
+              prices: [
+                {
+                  amount: 499,
+                  currency_code: "eur",
+                },
+                {
+                  amount: 549,
+                  currency_code: "usd",
+                },
+              ],
+            },
+          ],
+          sales_channels: [
+            {
+              id: defaultSalesChannel[0].id,
+            },
+          ],
+        },
+      ],
+    },
+  });
+  logger.info("Finished seeding scooter product data.");
+  } catch (err: any) {
+    logger.warn(`Scooter product already exists or failed to create: ${err.message}. Skipping scooter product creation.`);
+  }
 
   logger.info("Seeding inventory levels.");
 
